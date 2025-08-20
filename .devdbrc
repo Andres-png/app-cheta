@@ -1,0 +1,6 @@
+[
+  {
+    "type": "sqlite",
+    "path": "/workspaces/app-cheta/Api/app.db"
+  }
+]
