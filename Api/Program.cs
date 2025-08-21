@@ -1,25 +1,32 @@
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
+using Google.Apis.Auth;
+
+using BCrypt.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// ----------------- BASE DE DATOS -----------------
 builder.Services.AddDbContext<AppDbContext>(opt =>
     opt.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection") ?? "Data Source=app.db"));
 
-// Detectar si estamos en Codespaces
+// ----------------- URLS FRONTEND -----------------
 var isCodespaces = Environment.GetEnvironmentVariable("CODESPACES") == "true";
-var baseUrl = isCodespaces 
-    ? $"https://{Environment.GetEnvironmentVariable("cautious-fishstick-r4497qj7rwg6f5rqw")}-5174.app.github.dev"
+var baseUrl = isCodespaces
+    ? $"https://{Environment.GetEnvironmentVariable("GITHUB_CODESPACE_NAME")}-5174.app.github.dev"
     : "http://localhost:5174";
-var frontendUrl = isCodespaces 
-    ? $"https://{Environment.GetEnvironmentVariable("cautious-fishstick-r4497qj7rwg6f5rqw")}-5173.app.github.dev"
+var frontendUrl = isCodespaces
+    ? $"https://{Environment.GetEnvironmentVariable("GITHUB_CODESPACE_NAME")}-5173.app.github.dev"
     : "http://localhost:5173";
 
+// ----------------- CORS -----------------
 const string CorsPolicy = "AllowVite";
 builder.Services.AddCors(opt =>
 {
@@ -30,56 +37,59 @@ builder.Services.AddCors(opt =>
               .AllowCredentials());
 });
 
+// ----------------- JWT -----------------
 var jwtKey = builder.Configuration["JwtKey"] ?? "ClaveSuperSecretaDev_CambiaEnProd_123!";
 builder.Services.AddSingleton(new JwtService(jwtKey));
 
-builder.Services.AddAuthentication(Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
+// ----------------- AUTENTICACIÓN -----------------
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
     {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = false,
-            ValidateAudience = false,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
-        };
-    })
-    .AddGoogle(options =>
-    {
-        options.ClientId = builder.Configuration["Authentication:Google:ClientId"] ?? "";
-        options.ClientSecret = builder.Configuration["Authentication:Google:ClientSecret"] ?? "";
-        options.CallbackPath = "/api/auth/google-callback";
-        
-        // Configuración adicional para el callback
-        options.SaveTokens = true;
-        options.Scope.Add("email");
-        options.Scope.Add("profile");
-        
-        options.Events.OnCreatingTicket = context =>
-        {
-            // Agregar claims adicionales si es necesario
-            return Task.CompletedTask;
-        };
-    });
+        ValidateIssuer = false,
+        ValidateAudience = false,
+        ValidateLifetime = true,
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+    };
+})
+.AddGoogle(options =>
+{
+    options.ClientId = builder.Configuration["Authentication:Google:ClientId"] ?? "";
+    options.ClientSecret = builder.Configuration["Authentication:Google:ClientSecret"] ?? "";
+    options.CallbackPath = "/api/auth/google-callback";
+
+    options.SaveTokens = true;
+    options.Scope.Add("email");
+    options.Scope.Add("profile");
+});
 
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
+// ----------------- MIGRACIÓN AUTOMÁTICA -----------------
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.EnsureCreated();
 }
 
+// ----------------- MIDDLEWARE -----------------
 app.UseCors(CorsPolicy);
+app.UseCors("AllowVite");
 app.UseAuthentication();
 app.UseAuthorization();
 
+// ----------------- ENDPOINTS -----------------
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
 
-// ---------- AUTENTICACIÓN ----------
+// ---------- REGISTER ----------
 app.MapPost("/api/register", async (UserDto dto, AppDbContext db) =>
 {
     if (string.IsNullOrWhiteSpace(dto.Username) || string.IsNullOrWhiteSpace(dto.Password))
@@ -88,29 +98,56 @@ app.MapPost("/api/register", async (UserDto dto, AppDbContext db) =>
     if (await db.Users.AnyAsync(u => u.Username == dto.Username))
         return Results.BadRequest("Usuario ya existe.");
 
-    var user = new User { Username = dto.Username.Trim(), Password = dto.Password };
+    var hashedPassword = BCrypt.Net.BCrypt.HashPassword(dto.Password);
+
+    var user = new User
+    {
+        Username = dto.Username.Trim(),
+        Password = hashedPassword
+    };
+
     db.Users.Add(user);
     await db.SaveChangesAsync();
     return Results.Ok(new { message = "Registrado con éxito" });
 });
 
+// ---------- LOGIN ----------
 app.MapPost("/api/login", async (UserDto dto, AppDbContext db, JwtService jwt) =>
 {
-    var user = await db.Users.FirstOrDefaultAsync(u => u.Username == dto.Username && u.Password == dto.Password);
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Username == dto.Username);
     if (user == null) return Results.Unauthorized();
+
+    bool isPasswordValid;
+
+    if (user.Password.StartsWith("$2"))
+    {
+        isPasswordValid = BCrypt.Net.BCrypt.Verify(dto.Password, user.Password);
+    }
+    else
+    {
+        isPasswordValid = user.Password == dto.Password;
+
+        if (isPasswordValid)
+        {
+            user.Password = BCrypt.Net.BCrypt.HashPassword(dto.Password);
+            await db.SaveChangesAsync();
+        }
+    }
+
+    if (!isPasswordValid) return Results.Unauthorized();
 
     var token = jwt.GenerateToken(user.Username);
     return Results.Ok(new { token, username = user.Username });
 });
 
-// ---------- LOGIN CON GOOGLE (CORREGIDO) ----------
+// ---------- LOGIN CON GOOGLE ----------
 app.MapGet("/api/auth/google-login", () =>
 {
     var properties = new AuthenticationProperties
     {
         RedirectUri = "/api/auth/google-callback"
     };
-    
+
     return Results.Challenge(properties, new List<string> { "Google" });
 });
 
@@ -118,61 +155,81 @@ app.MapGet("/api/auth/google-callback", async (HttpContext context, AppDbContext
 {
     try
     {
-        Console.WriteLine("🔄 Procesando callback de Google...");
-        Console.WriteLine($"Query string: {context.Request.QueryString}");
-        
-        // Autenticar con Google
         var result = await context.AuthenticateAsync("Google");
-        
-        Console.WriteLine($"Authentication result succeeded: {result.Succeeded}");
-        
+
         if (!result.Succeeded)
         {
-            Console.WriteLine("❌ Error en autenticación con Google");
-            Console.WriteLine($"Failure message: {result.Failure?.Message}");
             return Results.Redirect($"{frontendUrl}/login?error=google_auth_failed");
         }
 
         var email = result.Principal?.FindFirst(ClaimTypes.Email)?.Value;
         var name = result.Principal?.FindFirst(ClaimTypes.Name)?.Value;
-        
-        Console.WriteLine($"Claims found - Email: {email}, Name: {name}");
-        Console.WriteLine($"All claims: {string.Join(", ", result.Principal?.Claims.Select(c => $"{c.Type}: {c.Value}") ?? new string[0])}");
 
         if (string.IsNullOrEmpty(email))
         {
-            Console.WriteLine("❌ No se pudo obtener el email de Google");
             return Results.Redirect($"{frontendUrl}/login?error=no_email");
         }
 
-        // Buscar o crear usuario
         var user = await db.Users.FirstOrDefaultAsync(u => u.Username == email);
         if (user == null)
         {
             user = new User
             {
                 Username = email,
-                Password = "GOOGLE_AUTH_" + Guid.NewGuid().ToString()
+                Password = BCrypt.Net.BCrypt.HashPassword("GOOGLE_AUTH_" + Guid.NewGuid().ToString())
             };
             db.Users.Add(user);
             await db.SaveChangesAsync();
-            Console.WriteLine($"✅ Usuario creado: {email}");
-        }
-        else
-        {
-            Console.WriteLine($"✅ Usuario existente encontrado: {email}");
         }
 
         var token = jwt.GenerateToken(user.Username);
-        Console.WriteLine($"✅ Token generado para: {user.Username}");
 
         return Results.Redirect($"{frontendUrl}/login?token={token}&username={Uri.EscapeDataString(user.Username)}");
     }
+    catch
+    {
+        return Results.Redirect($"{frontendUrl}/login?error=callback_exception");
+    }
+});
+
+app.MapPost("/api/auth/google", async (GoogleTokenDto dto, AppDbContext db, JwtService jwt, IConfiguration cfg) =>
+{
+    try
+    {
+        var clientId = cfg["Authentication:Google:ClientId"];
+        if (string.IsNullOrWhiteSpace(dto.Token) || string.IsNullOrWhiteSpace(clientId))
+            return Results.BadRequest("Token o ClientId faltante");
+
+        var settings = new GoogleJsonWebSignature.ValidationSettings
+        {
+            Audience = new[] { clientId }
+        };
+
+        var payload = await GoogleJsonWebSignature.ValidateAsync(dto.Token, settings);
+        var email = payload.Email;
+        var name = payload.Name;
+
+        if (string.IsNullOrWhiteSpace(email))
+            return Results.BadRequest("No se obtuvo email de Google");
+
+        var user = await db.Users.FirstOrDefaultAsync(u => u.Username == email);
+        if (user == null)
+        {
+            user = new User
+            {
+                Username = email,
+                Password = BCrypt.Net.BCrypt.HashPassword("GOOGLE_AUTH_" + Guid.NewGuid().ToString())
+            };
+            db.Users.Add(user);
+            await db.SaveChangesAsync();
+        }
+
+        var token = jwt.GenerateToken(user.Username);
+        return Results.Ok(new { token, username = user.Username });
+    }
     catch (Exception ex)
     {
-        Console.WriteLine($"❌ Excepción en Google callback: {ex.Message}");
-        Console.WriteLine($"Stack trace: {ex.StackTrace}");
-        return Results.Redirect($"{frontendUrl}/login?error=callback_exception");
+        return Results.BadRequest($"Error validando token de Google: {ex.Message}");
     }
 });
 
@@ -254,10 +311,14 @@ app.MapDelete("/api/form/{id}", async (int id, AppDbContext db, HttpContext http
     return Results.Ok(new { message = "Contacto eliminado" });
 }).RequireAuthorization();
 
+
+
 app.Run();
 
-// ---------- RECORDS Y MODELOS ----------
+// ----------------- RECORDS Y MODELOS -----------------
 record UserDto(string Username, string Password);
+record GoogleTokenDto(string Token);
+
 record FormDataDto(string Nombre, string Email, string? Telefono, string? Nota);
 
 class User

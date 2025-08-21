@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../api";
+import { register, login } from "../api"; // 👈 usamos api centralizada
 import {
   Box,
   Paper,
@@ -22,87 +22,78 @@ export default function Register() {
 
     try {
       // Registro
-      await api("/api/register", {
-        method: "POST",
-        body: JSON.stringify({ username, password }),
-      });
+      await register(username, password);
 
       // Login automático
-      const res = await api("/api/login", {
-        method: "POST",
-        body: JSON.stringify({ username, password }),
-      });
+      const res = await login(username, password);
 
       localStorage.setItem("token", res.token);
+      localStorage.setItem("username", res.username);
+
       navigate("/form", { replace: true });
     } catch (err) {
       setError(err.message || "Error en el registro");
     }
   }
 
-  return (
-    <Box
-                display="flex"
-      justifyContent="center"
-      alignItems="center"
-      flexGrow={1}
+return (
+  <Box
+    sx={{
+      position: "fixed",        // fuerza a ocupar toda la pantalla
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      display: "flex",
+      justifyContent: "center", // centra horizontal
+      alignItems: "center",     // centra vertical
+      p: 2,
+       backgroundColor: "background.default"
+    }}
+  >
+    <Paper
+      elevation={6}
       sx={{
-        minHeight: "calc(100vh - 64px)",
-        p: 2,
+        p: { xs: 2, sm: 4 },
+        width: "100%",
+        maxWidth: 500,
+        borderRadius: 3,
       }}
     >
-      <Paper
-        elevation={6}
-        sx={{
-          p: { xs: 2, sm: 4 },
-          width: "100%",
-          maxWidth: 500,
-          borderRadius: 3,
-          
- 
-        }}
-      >
-        <Typography variant="h5" gutterBottom textAlign="center">
-          Registro
-        </Typography>
+      <Typography variant="h5" gutterBottom textAlign="center">
+        Registro
+      </Typography>
 
-        {error && (
-          <Alert severity="error" sx={{ mb: 2 }}>
-            {error}
-          </Alert>
-        )}
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
 
-        <form onSubmit={handleSubmit} sx={{        }}>
-          <TextField
-            label="Usuario"
-            variant="outlined"
-            fullWidth
-            margin="normal"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            required
-          />
-          <TextField
-            label="Contraseña"
-            type="password"
-            variant="outlined"
-            fullWidth
-            margin="normal"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-          />
-          <Button
-            type="submit"
-            variant="contained"
-            color="primary"
-            fullWidth
-            sx={{ mt: 2 }}
-          >
-            Registrarse
-          </Button>
-        </form>
-      </Paper>
-    </Box>
-  );
+      <form onSubmit={handleSubmit}>
+        <TextField
+          label="Usuario"
+          fullWidth
+          margin="normal"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          required
+        />
+        <TextField
+          label="Contraseña"
+          type="password"
+          fullWidth
+          margin="normal"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+        />
+        <Button type="submit" variant="contained" fullWidth sx={{ mt: 2 }}>
+          Registrarse
+        </Button>
+      </form>
+    </Paper>
+  </Box>
+);
+
 }
