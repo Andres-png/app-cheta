@@ -8,7 +8,6 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using Google.Apis.Auth;
-
 using BCrypt.Net;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -82,9 +81,44 @@ using (var scope = app.Services.CreateScope())
 
 // ----------------- MIDDLEWARE -----------------
 app.UseCors(CorsPolicy);
-app.UseCors("AllowVite");
 app.UseAuthentication();
 app.UseAuthorization();
+
+// ----------------- HELPERS -----------------
+string? GetUsername(HttpContext http) => http.User.Identity?.Name;
+
+bool IsPasswordValid(User user, string inputPassword)
+{
+    if (user.Password.StartsWith("$2")) // BCrypt
+        return BCrypt.Net.BCrypt.Verify(inputPassword, user.Password);
+
+    return user.Password == inputPassword; // Legacy
+}
+
+async Task UpgradePasswordHashIfNeeded(User user, string inputPassword, AppDbContext db)
+{
+    if (!user.Password.StartsWith("$2") && user.Password == inputPassword)
+    {
+        user.Password = BCrypt.Net.BCrypt.HashPassword(inputPassword);
+        await db.SaveChangesAsync();
+    }
+}
+
+async Task<User> GetOrCreateGoogleUser(string email, AppDbContext db)
+{
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Username == email);
+    if (user == null)
+    {
+        user = new User
+        {
+            Username = email,
+            Password = BCrypt.Net.BCrypt.HashPassword("GOOGLE_AUTH_" + Guid.NewGuid().ToString())
+        };
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
+    }
+    return user;
+}
 
 // ----------------- ENDPOINTS -----------------
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
@@ -100,11 +134,7 @@ app.MapPost("/api/register", async (UserDto dto, AppDbContext db) =>
 
     var hashedPassword = BCrypt.Net.BCrypt.HashPassword(dto.Password);
 
-    var user = new User
-    {
-        Username = dto.Username.Trim(),
-        Password = hashedPassword
-    };
+    var user = new User { Username = dto.Username.Trim(), Password = hashedPassword };
 
     db.Users.Add(user);
     await db.SaveChangesAsync();
@@ -117,24 +147,10 @@ app.MapPost("/api/login", async (UserDto dto, AppDbContext db, JwtService jwt) =
     var user = await db.Users.FirstOrDefaultAsync(u => u.Username == dto.Username);
     if (user == null) return Results.Unauthorized();
 
-    bool isPasswordValid;
+    if (!IsPasswordValid(user, dto.Password))
+        return Results.Unauthorized();
 
-    if (user.Password.StartsWith("$2"))
-    {
-        isPasswordValid = BCrypt.Net.BCrypt.Verify(dto.Password, user.Password);
-    }
-    else
-    {
-        isPasswordValid = user.Password == dto.Password;
-
-        if (isPasswordValid)
-        {
-            user.Password = BCrypt.Net.BCrypt.HashPassword(dto.Password);
-            await db.SaveChangesAsync();
-        }
-    }
-
-    if (!isPasswordValid) return Results.Unauthorized();
+    await UpgradePasswordHashIfNeeded(user, dto.Password, db);
 
     var token = jwt.GenerateToken(user.Username);
     return Results.Ok(new { token, username = user.Username });
@@ -143,11 +159,7 @@ app.MapPost("/api/login", async (UserDto dto, AppDbContext db, JwtService jwt) =
 // ---------- LOGIN CON GOOGLE ----------
 app.MapGet("/api/auth/google-login", () =>
 {
-    var properties = new AuthenticationProperties
-    {
-        RedirectUri = "/api/auth/google-callback"
-    };
-
+    var properties = new AuthenticationProperties { RedirectUri = "/api/auth/google-callback" };
     return Results.Challenge(properties, new List<string> { "Google" });
 });
 
@@ -156,32 +168,14 @@ app.MapGet("/api/auth/google-callback", async (HttpContext context, AppDbContext
     try
     {
         var result = await context.AuthenticateAsync("Google");
-
         if (!result.Succeeded)
-        {
             return Results.Redirect($"{frontendUrl}/login?error=google_auth_failed");
-        }
 
         var email = result.Principal?.FindFirst(ClaimTypes.Email)?.Value;
-        var name = result.Principal?.FindFirst(ClaimTypes.Name)?.Value;
-
         if (string.IsNullOrEmpty(email))
-        {
             return Results.Redirect($"{frontendUrl}/login?error=no_email");
-        }
 
-        var user = await db.Users.FirstOrDefaultAsync(u => u.Username == email);
-        if (user == null)
-        {
-            user = new User
-            {
-                Username = email,
-                Password = BCrypt.Net.BCrypt.HashPassword("GOOGLE_AUTH_" + Guid.NewGuid().ToString())
-            };
-            db.Users.Add(user);
-            await db.SaveChangesAsync();
-        }
-
+        var user = await GetOrCreateGoogleUser(email, db);
         var token = jwt.GenerateToken(user.Username);
 
         return Results.Redirect($"{frontendUrl}/login?token={token}&username={Uri.EscapeDataString(user.Username)}");
@@ -200,31 +194,15 @@ app.MapPost("/api/auth/google", async (GoogleTokenDto dto, AppDbContext db, JwtS
         if (string.IsNullOrWhiteSpace(dto.Token) || string.IsNullOrWhiteSpace(clientId))
             return Results.BadRequest("Token o ClientId faltante");
 
-        var settings = new GoogleJsonWebSignature.ValidationSettings
-        {
-            Audience = new[] { clientId }
-        };
+        var payload = await GoogleJsonWebSignature.ValidateAsync(dto.Token,
+            new GoogleJsonWebSignature.ValidationSettings { Audience = new[] { clientId } });
 
-        var payload = await GoogleJsonWebSignature.ValidateAsync(dto.Token, settings);
-        var email = payload.Email;
-        var name = payload.Name;
-
-        if (string.IsNullOrWhiteSpace(email))
+        if (string.IsNullOrWhiteSpace(payload.Email))
             return Results.BadRequest("No se obtuvo email de Google");
 
-        var user = await db.Users.FirstOrDefaultAsync(u => u.Username == email);
-        if (user == null)
-        {
-            user = new User
-            {
-                Username = email,
-                Password = BCrypt.Net.BCrypt.HashPassword("GOOGLE_AUTH_" + Guid.NewGuid().ToString())
-            };
-            db.Users.Add(user);
-            await db.SaveChangesAsync();
-        }
-
+        var user = await GetOrCreateGoogleUser(payload.Email, db);
         var token = jwt.GenerateToken(user.Username);
+
         return Results.Ok(new { token, username = user.Username });
     }
     catch (Exception ex)
@@ -236,8 +214,8 @@ app.MapPost("/api/auth/google", async (GoogleTokenDto dto, AppDbContext db, JwtS
 // ---------- CRUD FORMULARIO ----------
 app.MapPost("/api/form", async (FormDataDto dto, AppDbContext db, HttpContext http) =>
 {
-    var username = http.User.Identity?.Name;
-    if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+    var username = GetUsername(http);
+    if (username is null) return Results.Unauthorized();
 
     if (string.IsNullOrWhiteSpace(dto.Nombre) || string.IsNullOrWhiteSpace(dto.Email))
         return Results.BadRequest("Nombre y Email requeridos.");
@@ -258,8 +236,8 @@ app.MapPost("/api/form", async (FormDataDto dto, AppDbContext db, HttpContext ht
 
 app.MapGet("/api/form", async (AppDbContext db, HttpContext http) =>
 {
-    var username = http.User.Identity?.Name;
-    if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+    var username = GetUsername(http);
+    if (username is null) return Results.Unauthorized();
 
     var contactos = await db.FormData
         .Where(f => f.Username == username)
@@ -271,22 +249,20 @@ app.MapGet("/api/form", async (AppDbContext db, HttpContext http) =>
 
 app.MapGet("/api/form/{id}", async (int id, AppDbContext db, HttpContext http) =>
 {
-    var username = http.User.Identity?.Name;
-    if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+    var username = GetUsername(http);
+    if (username is null) return Results.Unauthorized();
 
     var contacto = await db.FormData.FirstOrDefaultAsync(f => f.Id == id && f.Username == username);
-    if (contacto == null) return Results.NotFound();
-
-    return Results.Ok(contacto);
+    return contacto is null ? Results.NotFound() : Results.Ok(contacto);
 }).RequireAuthorization();
 
 app.MapPut("/api/form/{id}", async (int id, FormDataDto dto, AppDbContext db, HttpContext http) =>
 {
-    var username = http.User.Identity?.Name;
-    if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+    var username = GetUsername(http);
+    if (username is null) return Results.Unauthorized();
 
     var contacto = await db.FormData.FirstOrDefaultAsync(f => f.Id == id && f.Username == username);
-    if (contacto == null) return Results.NotFound();
+    if (contacto is null) return Results.NotFound();
 
     contacto.Nombre = dto.Nombre.Trim();
     contacto.Email = dto.Email.Trim();
@@ -299,11 +275,11 @@ app.MapPut("/api/form/{id}", async (int id, FormDataDto dto, AppDbContext db, Ht
 
 app.MapDelete("/api/form/{id}", async (int id, AppDbContext db, HttpContext http) =>
 {
-    var username = http.User.Identity?.Name;
-    if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+    var username = GetUsername(http);
+    if (username is null) return Results.Unauthorized();
 
     var contacto = await db.FormData.FirstOrDefaultAsync(f => f.Id == id && f.Username == username);
-    if (contacto == null) return Results.NotFound();
+    if (contacto is null) return Results.NotFound();
 
     db.FormData.Remove(contacto);
     await db.SaveChangesAsync();
@@ -311,14 +287,11 @@ app.MapDelete("/api/form/{id}", async (int id, AppDbContext db, HttpContext http
     return Results.Ok(new { message = "Contacto eliminado" });
 }).RequireAuthorization();
 
-
-
 app.Run();
 
 // ----------------- RECORDS Y MODELOS -----------------
 record UserDto(string Username, string Password);
 record GoogleTokenDto(string Token);
-
 record FormDataDto(string Nombre, string Email, string? Telefono, string? Nota);
 
 class User
