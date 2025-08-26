@@ -10,6 +10,7 @@ import {
   Alert,
   Divider,
 } from "@mui/material";
+import googleOneTap from "google-one-tap";
 
 export default function Login() {
   const [username, setUsername] = useState("");
@@ -20,14 +21,14 @@ export default function Login() {
 
   // Inicializar Google Identity Services
   useEffect(() => {
-    const script = document.createElement("script");
+    let script = document.createElement("script");
     script.src = "https://accounts.google.com/gsi/client";
     script.async = true;
     script.defer = true;
     document.body.appendChild(script);
 
     script.onload = () => {
-      window.google.accounts.id.initialize({
+      window.google.accounts.id.initialize({  
         client_id:
           "171570749927-7rjns7284seuka5ab7pp2uss1map1ghl.apps.googleusercontent.com", // 👈 tu ClientId real
         callback: handleGoogleResponse,
@@ -71,6 +72,7 @@ export default function Login() {
 
       navigate("/form", { replace: true });
     } catch (err) {
+      console.error("❌ Error en login normal:", err);
       setError("Usuario o contraseña incorrectos");
     } finally {
       setLoading(false);
@@ -153,7 +155,5 @@ return (
     </Paper>
   </Box>
 );
-
-
 
 }

@@ -7,7 +7,6 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      // Todo lo que empiece por /api va al backend .NET en 5174
       '/api': {
         target: 'http://localhost:5174',
         changeOrigin: true,

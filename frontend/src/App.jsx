@@ -18,16 +18,23 @@ import Toolbar from "@mui/material/Toolbar";
 import Button from "@mui/material/Button";
 import Typography from "@mui/material/Typography";
 import Box from "@mui/material/Box";
+import { red } from '@mui/material/colors';
 
 // 🔹 Función para obtener el token
 function getToken() {
   return localStorage.getItem("token");
 }
 
+import PropTypes from "prop-types";
+
 function PrivateRoute({ children }) {
   const token = getToken();
   return token ? children : <Navigate to="/login" />;
 }
+
+PrivateRoute.propTypes = {
+  children: PropTypes.node.isRequired,
+};
 
 function Navbar() {
   const navigate = useNavigate();
@@ -39,7 +46,7 @@ function Navbar() {
   }
 
   return (
-    <AppBar position="fixed" color="primary" sx={{ width: "100%" }}>
+    <AppBar position="fixed" color="primary" sx={{ width: "100%"}}>
       <Toolbar>
         <Typography variant="h6" sx={{ flexGrow: 1 }}>
           Mi Aplicación
@@ -53,9 +60,9 @@ function Navbar() {
               Contactos
             </Button>
             <Button
-              color="secondary"
               variant="contained"
               onClick={handleLogout}
+              sx={{ bgcolor: red[800], "&:hover": { bgcolor: red[500] } }}
             >
               Cerrar sesión
             </Button>
